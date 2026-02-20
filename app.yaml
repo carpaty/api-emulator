@@ -1,4 +1,5 @@
 runtime: python314
 instance_class: F1
-entrypoint: gunicorn -b :$PORT -k uvicorn.workers.UvicornWorker main:app
+entrypoint: gunicorn -b :$PORT main:app
 env: standard
+app_engine_apis: true

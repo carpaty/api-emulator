@@ -3,16 +3,33 @@
 
 from __future__ import annotations
 
+import json
+import logging
+import os
 import time
 import uuid
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="API Emulator", version="0.1.0")
+asgi_app = FastAPI(title="API Emulator", version="0.1.0")
 
 DEFAULT_MODEL = "emulator-llm"
+PINGGY_CACHE_KEY = "pinggy_url"
+_pinggy_url_fallback: str | None = None
+_IS_GAE_STD = os.getenv("GAE_ENV", "").startswith("standard")
+_logger = logging.getLogger(__name__)
+_memcache_import_error: Exception | None = None
+
+try:
+    from google.appengine.api import memcache as gae_memcache
+except Exception as exc:  # pragma: no cover - depends on runtime environment
+    gae_memcache = None
+    _memcache_import_error = exc
+    if _IS_GAE_STD:
+        _logger.exception("App Engine memcache import failed")
 
 
 class OpenAIMessage(BaseModel):
@@ -49,6 +66,10 @@ class OllamaChatRequest(BaseModel):
     stream: bool = False
 
 
+class PinggyRequest(BaseModel):
+    URL: str
+
+
 def _extract_text(value: Any) -> str:
     if isinstance(value, str):
         return value
@@ -64,12 +85,82 @@ def _fake_text(seed: str) -> str:
     return f"Fake response from emulator. User request: {cleaned[:300]}"
 
 
-@app.get("/healthz")
+def _memcache_client() -> Any | None:
+    if gae_memcache is None:
+        return None
+
+    try:
+        # Build client inside request context to get active security ticket.
+        return gae_memcache.Client()
+    except Exception as exc:
+        if _IS_GAE_STD:
+            raise HTTPException(status_code=500, detail=f"Memcache client exception: {exc}")
+        return None
+
+
+def _pinggy_set(url: str) -> None:
+    global _pinggy_url_fallback
+
+    client = _memcache_client()
+    if client is not None:
+        try:
+            ok = client.set(PINGGY_CACHE_KEY, url)
+            if ok:
+                return
+            if _IS_GAE_STD:
+                raise HTTPException(status_code=500, detail="Memcache set failed")
+        except HTTPException:
+            raise
+        except Exception as exc:
+            if _IS_GAE_STD:
+                raise HTTPException(status_code=500, detail=f"Memcache set exception: {exc}")
+
+    if _IS_GAE_STD:
+        detail = "Memcache unavailable"
+        if _memcache_import_error is not None:
+            detail = f"Memcache unavailable: {_memcache_import_error}"
+        raise HTTPException(status_code=500, detail=detail)
+
+    _pinggy_url_fallback = url
+
+
+def _pinggy_get() -> str | None:
+    client = _memcache_client()
+    if client is not None:
+        try:
+            cached = client.get(PINGGY_CACHE_KEY)
+            if isinstance(cached, str) and cached:
+                return cached
+        except Exception as exc:
+            if _IS_GAE_STD:
+                raise HTTPException(status_code=500, detail=f"Memcache get exception: {exc}")
+
+    if _IS_GAE_STD and _memcache_import_error is not None:
+        raise HTTPException(status_code=500, detail=f"Memcache unavailable: {_memcache_import_error}")
+
+    return _pinggy_url_fallback
+
+
+@asgi_app.get("/healthz")
 def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.get("/v1/models")
+@asgi_app.post("/pinggy")
+async def pinggy_set(req: PinggyRequest) -> dict[str, str]:
+    _pinggy_set(req.URL)
+    return {"URL": req.URL}
+
+
+@asgi_app.get("/pinggy")
+async def pinggy_get() -> Response:
+    url = _pinggy_get()
+    if not url:
+        raise HTTPException(status_code=404, detail="Pinggy URL not set")
+    return Response(status_code=307, headers={"Location": url})
+
+
+@asgi_app.get("/v1/models")
 def openai_models() -> dict[str, Any]:
     created = int(time.time())
     return {
@@ -81,7 +172,7 @@ def openai_models() -> dict[str, Any]:
     }
 
 
-@app.post("/v1/chat/completions")
+@asgi_app.post("/v1/chat/completions")
 def openai_chat(req: OpenAIChatRequest) -> dict[str, Any]:
     last_msg = req.messages[-1].content if req.messages else ""
     content = _fake_text(_extract_text(last_msg))
@@ -103,7 +194,7 @@ def openai_chat(req: OpenAIChatRequest) -> dict[str, Any]:
     }
 
 
-@app.post("/v1/completions")
+@asgi_app.post("/v1/completions")
 def openai_completions(req: OpenAICompletionRequest) -> dict[str, Any]:
     prompt = _extract_text(req.prompt)
     text = _fake_text(prompt)
@@ -119,7 +210,7 @@ def openai_completions(req: OpenAICompletionRequest) -> dict[str, Any]:
     }
 
 
-@app.post("/v1/embeddings")
+@asgi_app.post("/v1/embeddings")
 def openai_embeddings(req: OpenAIEmbeddingRequest) -> dict[str, Any]:
     inputs = req.input if isinstance(req.input, list) else [req.input]
     data = []
@@ -138,7 +229,7 @@ def openai_embeddings(req: OpenAIEmbeddingRequest) -> dict[str, Any]:
     }
 
 
-@app.get("/api/tags")
+@asgi_app.get("/api/tags")
 def ollama_tags() -> dict[str, Any]:
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     return {
@@ -155,7 +246,7 @@ def ollama_tags() -> dict[str, Any]:
     }
 
 
-@app.post("/api/generate")
+@asgi_app.post("/api/generate")
 def ollama_generate(req: OllamaGenerateRequest) -> dict[str, Any]:
     response_text = _fake_text(req.prompt)
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -176,7 +267,7 @@ def ollama_generate(req: OllamaGenerateRequest) -> dict[str, Any]:
     }
 
 
-@app.post("/api/chat")
+@asgi_app.post("/api/chat")
 def ollama_chat(req: OllamaChatRequest) -> dict[str, Any]:
     content = ""
     if req.messages:
@@ -197,3 +288,79 @@ def ollama_chat(req: OllamaChatRequest) -> dict[str, Any]:
         "eval_duration": 400000,
         "user_request": {"model": req.model, "messages": req.messages, "stream": req.stream},
     }
+
+
+def _wsgi_json_response(start_response: Any, status: str, body: dict[str, Any], headers: list[tuple[str, str]] | None = None) -> list[bytes]:
+    payload = json.dumps(body).encode("utf-8")
+    final_headers = [("Content-Type", "application/json"), ("Content-Length", str(len(payload)))]
+    if headers:
+        final_headers.extend(headers)
+    start_response(status, final_headers)
+    return [payload]
+
+
+def _wsgi_pinggy_router(asgi_wsgi_app: Any, environ: dict[str, Any], start_response: Any) -> list[bytes]:
+    path = environ.get("PATH_INFO", "")
+    method = (environ.get("REQUEST_METHOD") or "").upper()
+    if path != "/pinggy":
+        return asgi_wsgi_app(environ, start_response)
+
+    if method == "POST":
+        try:
+            content_length = int(environ.get("CONTENT_LENGTH") or "0")
+        except ValueError:
+            content_length = 0
+
+        raw_body = environ["wsgi.input"].read(content_length) if content_length > 0 else b""
+        try:
+            payload = json.loads(raw_body.decode("utf-8") if raw_body else "{}")
+        except Exception:
+            return _wsgi_json_response(start_response, "400 Bad Request", {"detail": "Invalid JSON body"})
+
+        url = payload.get("URL") if isinstance(payload, dict) else None
+        if not isinstance(url, str) or not url:
+            return _wsgi_json_response(start_response, "422 Unprocessable Entity", {"detail": "URL is required"})
+
+        try:
+            _pinggy_set(url)
+        except HTTPException as exc:
+            return _wsgi_json_response(start_response, f"{exc.status_code} Error", {"detail": exc.detail})
+
+        return _wsgi_json_response(start_response, "200 OK", {"URL": url})
+
+    if method == "GET":
+        try:
+            url = _pinggy_get()
+        except HTTPException as exc:
+            return _wsgi_json_response(start_response, f"{exc.status_code} Error", {"detail": exc.detail})
+
+        if not url:
+            return _wsgi_json_response(start_response, "404 Not Found", {"detail": "Pinggy URL not set"})
+
+        start_response("307 Temporary Redirect", [("Location", url), ("Content-Length", "0")])
+        return [b""]
+
+    start_response("405 Method Not Allowed", [("Allow", "GET, POST"), ("Content-Length", "0")])
+    return [b""]
+
+
+def _build_serving_app() -> Any:
+    if not _IS_GAE_STD:
+        return asgi_app
+
+    try:
+        from a2wsgi import ASGIMiddleware
+        from google.appengine.api import wrap_wsgi_app
+
+        asgi_wsgi_app = ASGIMiddleware(asgi_app)
+
+        def _root_wsgi_app(environ: dict[str, Any], start_response: Any) -> list[bytes]:
+            return _wsgi_pinggy_router(asgi_wsgi_app, environ, start_response)
+
+        return wrap_wsgi_app(_root_wsgi_app)
+    except Exception as exc:
+        _logger.exception("Failed to wrap FastAPI app for App Engine bundled APIs: %s", exc)
+        return asgi_app
+
+
+app = _build_serving_app()
