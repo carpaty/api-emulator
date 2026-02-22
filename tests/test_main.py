@@ -18,6 +18,13 @@ def test_healthz():
     assert response.json() == {"status": "ok"}
 
 
+def test_post_image_returns_png():
+    response = client.post("/image")
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/png"
+    assert response.content.startswith(b"\x89PNG\r\n\x1a\n")
+
+
 def test_openai_chat_includes_user_request():
     payload = {
         "model": "gpt-4o-mini",
