@@ -18,6 +18,9 @@ Ollama-style:
 Health:
 - `GET /healthz`
 
+Image emulation:
+- `POST /image` (returns dummy `image/png`)
+
 ## Run locally
 
 ```bash
